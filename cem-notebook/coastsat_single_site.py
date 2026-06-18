@@ -94,8 +94,13 @@ def is_projected(epsg: int) -> bool:
 
 
 def write_xy(xs, ys, path: str, close_ring: bool = False,
-             precision: int = 6) -> int:
-    """Write 'x y' rows (projected metres) to *path*. Returns point count."""
+             precision: int = 6, header=None) -> int:
+    """Write 'x y' rows (projected metres) to *path*. Returns point count.
+
+    *header* (an iterable of strings) is written as leading ``# ...`` comment
+    lines -- np.loadtxt skips these, so a downstream notebook can recover, e.g.,
+    the land direction and EPSG from the file instead of guessing them.
+    """
     xs = [float(v) for v in xs]
     ys = [float(v) for v in ys]
     if not xs:
@@ -105,6 +110,8 @@ def write_xy(xs, ys, path: str, close_ring: bool = False,
         ys.append(ys[0])
     fmt = "%.{}f".format(int(precision))
     with open(path, "w") as fh:
+        for line in (header or []):
+            fh.write(f"# {line}\n")
         for x, y in zip(xs, ys):
             fh.write(f"{fmt % x} {fmt % y}\n")
     return len(xs)
@@ -320,6 +327,166 @@ def shoreline_for_cem(site, year, data_dir=None, transects=None, timeseries=None
 
 
 # --------------------------------------------------------------------------- #
+# Multi-site stitching (build a LONG shoreline by joining adjacent sites)      #
+# --------------------------------------------------------------------------- #
+def list_sites(data_dir):
+    """Every site id under *data_dir* that has a time-series CSV (i.e. is
+    extractable). Sorted by natural order so numbering runs along the coast."""
+    out = []
+    if data_dir and os.path.isdir(data_dir):
+        for name in os.listdir(data_dir):
+            if os.path.exists(os.path.join(
+                    data_dir, name, "time_series_tidally_corrected.csv")):
+                out.append(name)
+    return sorted(out, key=_natural_key)
+
+
+def _site_num(site):
+    """Split a site id into (prefix, digits) on its trailing number, e.g.
+    'usa_NC_0030' -> ('usa_NC_', '0030'). Returns None if it has no number."""
+    m = re.match(r"^(.*?)(\d+)$", str(site))
+    return (m.group(1), m.group(2)) if m else None
+
+
+def neighbor_sites(seed, n, data_dir):
+    """*seed* plus up to *n* sites on each side, by trailing number, keeping
+    only those that actually exist under *data_dir*. Ordered along the coast."""
+    parsed = _site_num(seed)
+    if parsed is None or n <= 0:
+        return [seed]
+    prefix, digits = parsed
+    width, base = len(digits), int(digits)
+    have = set(list_sites(data_dir))
+    out = [f"{prefix}{k:0{width}d}" for k in range(base - n, base + n + 1) if k >= 0]
+    out = [s for s in out if s in have]
+    return out or [seed]
+
+
+def _common_epsg(sites, transects_path, src_epsg=4326):
+    """Pick ONE metric (UTM) EPSG from the centroid of all transects of *sites*,
+    so every stitched site is placed in the same CRS."""
+    import json
+    with open(transects_path) as fh:
+        gj = json.load(fh)
+    sel = {str(s) for s in sites}
+    lons, lats = [], []
+    for ft in gj.get("features", []):
+        if str(ft.get("properties", {}).get("site_id")) in sel:
+            c0 = ft["geometry"]["coordinates"][0]
+            lons.append(c0[0]); lats.append(c0[1])
+    if not lons:
+        return None
+    clon, clat = sum(lons) / len(lons), sum(lats) / len(lats)
+    if int(src_epsg) != 4326:
+        (clon,), (clat,) = reproject([clon], [clat], src_epsg, 4326)
+    return utm_epsg(clon, clat)
+
+
+def _chain_segments(segments):
+    """Join a list of (xs, ys) polylines into ONE continuous line.
+
+    Sites come back internally ordered but with no guarantee that site A's tail
+    meets site B's head -- a naive concatenation would zig-zag at every join.
+    So we (1) use a PCA axis over all points to pick a natural starting end,
+    then (2) greedily append whichever remaining segment has an endpoint nearest
+    the current tail, reversing it if its *far* end is the nearer one. This is
+    robust to site order, per-site direction, gaps, and gentle coast curvature.
+    """
+    import numpy as np
+    segs = [(np.asarray(xs, float), np.asarray(ys, float))
+            for xs, ys in segments if len(xs) > 0]
+    if not segs:
+        return [], []
+    if len(segs) == 1:
+        return list(segs[0][0]), list(segs[0][1])
+
+    allx = np.concatenate([s[0] for s in segs])
+    ally = np.concatenate([s[1] for s in segs])
+    pca = np.column_stack([allx - allx.mean(), ally - ally.mean()])
+    axis = np.linalg.svd(pca, full_matrices=False)[2][0]
+    proj = lambda px, py: px * axis[0] + py * axis[1]
+
+    # start at the segment reaching furthest "back" along the axis, pointed +axis
+    i0 = int(np.argmin([min(proj(s[0][0], s[1][0]), proj(s[0][-1], s[1][-1]))
+                        for s in segs]))
+    xs, ys = segs[i0]
+    if proj(xs[0], ys[0]) > proj(xs[-1], ys[-1]):
+        xs, ys = xs[::-1], ys[::-1]
+    chainx, chainy = list(xs), list(ys)
+    used = {i0}
+
+    while len(used) < len(segs):
+        tx, ty = chainx[-1], chainy[-1]
+        best, rev, bestd = None, False, None
+        for j, (xs, ys) in enumerate(segs):
+            if j in used:
+                continue
+            dhead = (xs[0] - tx) ** 2 + (ys[0] - ty) ** 2
+            dtail = (xs[-1] - tx) ** 2 + (ys[-1] - ty) ** 2
+            d, r = (dhead, False) if dhead <= dtail else (dtail, True)
+            if bestd is None or d < bestd:
+                bestd, best, rev = d, j, r
+        xs, ys = segs[best]
+        if rev:
+            xs, ys = xs[::-1], ys[::-1]
+        chainx += list(xs); chainy += list(ys)
+        used.add(best)
+    return chainx, chainy
+
+
+def extract_zenodo_multi(sites, year, transects_path, data_dir,
+                         target_epsg=None, src_epsg=4326, month=6, day=30,
+                         smooth_days=180, order="ascending"):
+    """Reconstruct and stitch several sites into ONE long shoreline.
+
+    Reuses the single-site reconstruction per site (each site has its own
+    time-series CSV, but they share one transects.geojson), forces a common CRS,
+    then chains the segments head-to-tail. Returns
+    (xs, ys, epsg, n, sea_dir, per_site) where per_site is [(site, n_points), ...].
+    """
+    if not sites:
+        raise SystemExit("No sites given to stitch.")
+    if target_epsg is None:
+        target_epsg = _common_epsg(sites, transects_path, src_epsg)
+
+    segments, sea_acc, per_site = [], [0.0, 0.0], []
+    for s in sites:
+        _, cpath = find_zenodo_files(s, data_dir, transects_path, None)
+        xs, ys, ep, n, sea = extract_zenodo(
+            site=s, year=year, transects_path=transects_path,
+            timeseries_path=cpath, target_epsg=target_epsg, src_epsg=src_epsg,
+            month=month, day=day, smooth_days=smooth_days, order=order)
+        target_epsg = ep                       # lock CRS after the first
+        segments.append((xs, ys))
+        sea_acc[0] += sea[0] * n; sea_acc[1] += sea[1] * n
+        per_site.append((s, n))
+
+    xs, ys = _chain_segments(segments)
+    snorm = math.hypot(*sea_acc) or 1.0
+    sea_dir = (sea_acc[0] / snorm, sea_acc[1] / snorm)   # point-count weighted
+    return xs, ys, int(target_epsg), len(xs), sea_dir, per_site
+
+
+def shoreline_for_cem_multi(sites, year, data_dir=None, transects=None,
+                            epsg=None, src_epsg=4326, month=6, day=30,
+                            smooth_days=180, order="ascending"):
+    """High-level multi-site entry for notebooks (zenodo route).
+
+    Same contract as ``shoreline_for_cem`` but for a LIST of adjacent sites,
+    returning one stitched shoreline. ``site`` in the result is '+'.join(sites).
+    """
+    if isinstance(sites, str):
+        sites = [sites]
+    tpath, _ = find_zenodo_files(sites[0], data_dir, transects, None)
+    xs, ys, out_epsg, n, sea_dir, _per = extract_zenodo_multi(
+        sites, year, tpath, data_dir, target_epsg=epsg, src_epsg=src_epsg,
+        month=month, day=day, smooth_days=smooth_days, order=order)
+    land_dir = (-sea_dir[0], -sea_dir[1]) if sea_dir else None
+    return ShorelineForCem(xs, ys, out_epsg, n, land_dir, sea_dir,
+                           "+".join(sites), year)
+
+
+# --------------------------------------------------------------------------- #
 # Portable input discovery (so notebooks need no hard-coded absolute paths)    #
 # --------------------------------------------------------------------------- #
 def _candidate_roots(search_roots=None, max_up: int = 5):
@@ -486,7 +653,7 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     sub = p.add_subparsers(dest="source", required=True,
-                           metavar="{zenodo,imagery}")
+                           metavar="{zenodo,zenodo-multi,imagery}")
 
     # shared output options factored into a parent parser
     common = argparse.ArgumentParser(add_help=False)
@@ -516,6 +683,37 @@ def build_parser() -> argparse.ArgumentParser:
     z.add_argument("--order", choices=["ascending", "descending"], default="ascending",
                    help="along-shore vertex order by transect id")
 
+    # ---- multi-site stitching (one LONG .xy from several adjacent sites) ---- #
+    zm = sub.add_parser(
+        "zenodo-multi",
+        help="stitch several adjacent Zenodo sites into one long .xy")
+    zm.add_argument("--out", default=None,
+                    help="output .xy path (required unless --list-sites)")
+    zm.add_argument("--epsg", type=int, default=None,
+                    help="output EPSG (metric). Default: one UTM zone for the whole span.")
+    zm.add_argument("--close-ring", action="store_true",
+                    help="repeat the first point at the end (default: open line)")
+    zm.add_argument("--sites", nargs="+", default=None,
+                    help="explicit site ids, e.g. usa_NC_0029 usa_NC_0030 usa_NC_0031")
+    zm.add_argument("--site", default=None,
+                    help="seed site id (combine with --neighbors)")
+    zm.add_argument("--neighbors", type=int, default=0,
+                    help="with --site: also take N sites on EACH side (e.g. 3 -> 7 total)")
+    zm.add_argument("--list-sites", action="store_true",
+                    help="just print the extractable site ids under --data-dir and exit")
+    zm.add_argument("--year", type=int, default=None, help="target year (~1984-2025)")
+    zm.add_argument("--data-dir", default=None, required=True,
+                    help="unzipped Zenodo shoreline_data/ folder")
+    zm.add_argument("--transects", default=None, help="override path to transects.geojson")
+    zm.add_argument("--src-epsg", type=int, default=4326,
+                    help="CRS of the transects geojson coordinates (default 4326)")
+    zm.add_argument("--month", type=int, default=6, help="target month (default 6)")
+    zm.add_argument("--day", type=int, default=30, help="target day (default 30)")
+    zm.add_argument("--smooth-days", type=int, default=180,
+                    help="centred rolling-mean window in days (0 = off, default 180)")
+    zm.add_argument("--order", choices=["ascending", "descending"], default="ascending",
+                    help="along-shore vertex order within each site")
+
     m = sub.add_parser("imagery", parents=[common],
                        help="digitise one shoreline from imagery with CoastSat (needs GEE)")
     m.add_argument("--polygon", required=True,
@@ -544,6 +742,47 @@ def main(argv=None) -> int:
             target_epsg=args.epsg, src_epsg=args.src_epsg,
             month=args.month, day=args.day, smooth_days=args.smooth_days,
             order=args.order)
+    elif args.source == "zenodo-multi":
+        if args.list_sites:
+            sites = list_sites(args.data_dir)
+            print(f"{len(sites)} extractable sites under {args.data_dir}:")
+            for s in sites:
+                print(" ", s)
+            return 0
+        if not args.year:
+            raise SystemExit("--year is required.")
+        if args.sites:
+            sites = list(args.sites)
+        elif args.site:
+            sites = neighbor_sites(args.site, args.neighbors, args.data_dir)
+        else:
+            raise SystemExit("Provide --sites a b c, or --site SEED [--neighbors N], "
+                             "or --list-sites.")
+        if not args.out:
+            raise SystemExit("--out is required (unless --list-sites).")
+        tpath, _ = find_zenodo_files(sites[0], args.data_dir, args.transects, None)
+        xs, ys, out_epsg, n, sea_dir, per = extract_zenodo_multi(
+            sites, args.year, tpath, args.data_dir, target_epsg=args.epsg,
+            src_epsg=args.src_epsg, month=args.month, day=args.day,
+            smooth_days=args.smooth_days, order=args.order)
+        ld = (-sea_dir[0], -sea_dir[1])
+        written = write_xy(xs, ys, args.out, close_ring=args.close_ring,
+                           header=[f"land_dir {ld[0]:.4f} {ld[1]:.4f}",
+                                   f"epsg {out_epsg}",
+                                   f"sites {'+'.join(s for s, _ in per)}",
+                                   f"year {args.year}"])
+        try:
+            import numpy as _np
+            length_km = float(_np.hypot(_np.diff(xs), _np.diff(ys)).sum()) / 1000.0
+        except Exception:
+            length_km = float("nan")
+        print(f"Stitched {len(sites)} sites -> {args.out}")
+        print("  sites:", ", ".join(f"{s}({c})" for s, c in per))
+        print(f"  {written} points, EPSG:{out_epsg}, length ~{length_km:.1f} km, "
+              f"land_dir~=({ld[0]:.2f}, {ld[1]:.2f})")
+        print(f"  -> in cem_run_xy set XY_PATH=\"{os.path.basename(args.out)}\", "
+              f"LAND_DIR=({round(ld[0])}, {round(ld[1])})")
+        return 0
     else:  # imagery
         xs, ys, out_epsg, n, _sea = extract_imagery(
             polygon=parse_polygon(args.polygon), dates=args.dates,
@@ -551,7 +790,10 @@ def main(argv=None) -> int:
             target_epsg=args.epsg, cloud_thresh=args.cloud_thresh,
             skip_download=args.skip_download)
 
-    written = write_xy(xs, ys, args.out, close_ring=args.close_ring)
+    hdr = [f"epsg {out_epsg}"]
+    if _sea is not None:
+        hdr.insert(0, f"land_dir {-_sea[0]:.4f} {-_sea[1]:.4f}")
+    written = write_xy(xs, ys, args.out, close_ring=args.close_ring, header=hdr)
     print(f"Wrote {written} points to {args.out} (EPSG:{out_epsg}, "
           f"{'closed ring' if args.close_ring else 'open line'}).")
     return 0
